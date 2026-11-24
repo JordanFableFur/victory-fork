@@ -260,7 +260,7 @@ mod tests {
         let mut file = standalone.clone();
         file.extend_from_slice(b"harmless tail");
         // The file holds one container; the standalone scan finds it alone.
-        let [only] = sources(&file)[..] else {
+        let [only] = &sources(&file)[..] else {
             panic!("{} containers", sources(&file).len())
         };
         let bytes = &standalone[..];
