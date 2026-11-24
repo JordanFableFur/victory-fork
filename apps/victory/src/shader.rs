@@ -259,12 +259,11 @@ mod tests {
         let standalone = container();
         let mut file = standalone.clone();
         file.extend_from_slice(b"harmless tail");
-        let found = sources(&file);
-        let [a, b] = &found[..] else {
-            panic!("{} containers", found.len())
+        // The file holds one container; the standalone scan finds it alone.
+        let [only] = sources(&file)[..] else {
+            panic!("{} containers", sources(&file).len())
         };
         let bytes = &standalone[..];
-        assert_eq!(a.bytes().as_deref(), Some(bytes));
-        assert_eq!(b.bytes().as_deref(), Some(bytes));
+        assert_eq!(only.bytes().as_deref(), Some(bytes));
     }
 }
