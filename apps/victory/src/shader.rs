@@ -22,7 +22,15 @@ impl Source<'_> {
     /// The container bytes; `None` if a packed record is corrupt.
     pub(crate) fn bytes(&self) -> Option<Cow<'_, [u8]>> {
         match self {
-            Source::Raw { data, .. } => Some(Cow::Borrowed(data)),
+            Source::Raw { data, .. } => {
+                // Nothing past the container's own end: what follows belongs to
+                // whatever comes next in the file, and the runtime reads a
+                // container at its declared length, so the hash in a run's log
+                // (`hash=` in first bind, shader does not translate) is of those
+                // bytes, not of the slice the file was found in.
+                let size = Container::parse(data).ok()?.size();
+                Some(Cow::Borrowed(&data[..size]))
+            }
             Source::Packed(r) => r.unpack().map(Cow::Owned),
         }
     }
@@ -224,4 +232,39 @@ fn format_instruction(i: &Instruction, wave64: bool) -> String {
         None => format!("<{:?} {:#x}>", i.encoding, i.opcode),
     };
     format!("    {:06x}: {:<44} {text}", i.offset, words.join(" "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One part of four bytes, no DXIL: enough for `sources` to find.
+    fn container() -> Vec<u8> {
+        let mut bytes = b"DXBC".to_vec();
+        bytes.extend([0; 16]); // digest
+        bytes.extend(1u16.to_le_bytes()); // version
+        bytes.extend(0u16.to_le_bytes());
+        let total = 0x20 + 4 + 8 + 4; // header, part table, part header, data
+        bytes.extend((total as u32).to_le_bytes());
+        bytes.extend(1u32.to_le_bytes()); // one part
+        bytes.extend(((0x20 + 4) as u32).to_le_bytes()); // the part at its end
+        bytes.extend(b"HASH");
+        bytes.extend(4u32.to_le_bytes());
+        bytes.extend([9; 4]);
+        bytes
+    }
+
+    #[test]
+    fn a_container_and_its_copy_with_a_tail_hash_the_same() {
+        let standalone = container();
+        let mut file = standalone.clone();
+        file.extend_from_slice(b"harmless tail");
+        let found = sources(&file);
+        let [a, b] = &found[..] else {
+            panic!("{} containers", found.len())
+        };
+        let bytes = &standalone[..];
+        assert_eq!(a.bytes().as_deref(), Some(bytes));
+        assert_eq!(b.bytes().as_deref(), Some(bytes));
+    }
 }

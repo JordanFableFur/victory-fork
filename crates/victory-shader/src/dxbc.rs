@@ -109,6 +109,16 @@ impl<'a> Container<'a> {
     pub fn part(&self, fourcc: FourCC) -> Option<&Part<'a>> {
         self.parts.iter().find(|p| p.fourcc == fourcc)
     }
+
+    /// The container's byte length from its header: what `parse` cut its
+    /// view of `data` down to. A source holding the container inside a
+    /// larger file slices itself to this, so the same container gives the
+    /// same bytes and the same hash wherever it sits.
+    pub fn size(&self) -> usize {
+        self.parts
+            .last()
+            .map_or(HEADER_SIZE, |last| last.offset + 8 + last.data.len())
+    }
 }
 
 pub(crate) fn u16_at(data: &[u8], at: usize) -> Result<u16, ShaderError> {
