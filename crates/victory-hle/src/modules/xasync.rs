@@ -69,6 +69,11 @@ impl Mode {
 struct Task {
     context: usize,
     callback: usize,
+    /// The queue that submitted the task, as its port sees it (`None` for
+    /// the process queue, whose pointer moves). A port shared by queues
+    /// (a composite) only cancels a terminated queue's own tasks: the
+    /// queues using the port have independent lifetimes.
+    owner: Option<usize>,
 }
 
 impl Task {
@@ -76,6 +81,7 @@ impl Task {
         Task {
             context: context as usize,
             callback: callback as usize,
+            owner: None,
         }
     }
 
@@ -226,7 +232,15 @@ impl Queue {
         S_OK
     }
 
-    fn deliver(self: &Arc<Self>, port: u32, task: Task) {
+    fn deliver(self: &Arc<Self>, port: u32, mut task: Task) {
+        // The submitting queue, by its handle's object: a port shared with
+        // a composite (or a base) keeps tasks from both, and only the
+        // queue being terminated gives its own up. The handle outlives
+        // every task it submitted: a task runs or is dropped while a
+        // reference to its queue is still held (each submit clones the
+        // queue for a delayed task; a port task runs before the last
+        // reference goes).
+        task.owner = Some(Arc::as_ptr(self) as usize);
         self.ports[port as usize].submit(task);
         // Copied out: a monitor may unregister itself.
         let monitors = lock(&self.monitors).clone();
@@ -370,7 +384,10 @@ pub fn XTaskQueueSubmitDelayedCallback(
 }
 
 /// Cancels what is still queued (callbacks see `canceled`), refuses new
-/// work, then calls `callback`.
+/// work, then calls `callback`. On a port shared with other queues (a
+/// composite's), only this queue's tasks are cancelled: the queues using
+/// the port have independent lifetimes, so the others keep their place in
+/// the queue and run uncanceled.
 pub fn XTaskQueueTerminate(
     handle: *const Queue,
     _wait: bool,
@@ -381,15 +398,37 @@ pub fn XTaskQueueTerminate(
         return E_INVALIDARG;
     };
     queue.terminated.store(true, Ordering::Release);
+    let owner = Arc::as_ptr(&queue) as usize;
+    // This queue's tasks come out of each port; the others keep their FIFO
+    // place in the deque. Partitioning under the port's mutex: a task's
+    // cancellation callback may terminate another queue on the port or
+    // submit new work, and neither may see the other queues' tasks hidden
+    // in a local list (a nested terminate would pass them by, a submit
+    // would overtake them).
+    let mut cancelled = Vec::new();
     for port in &queue.ports {
-        let pending: Vec<Task> = lock(&port.tasks).drain(..).collect();
-        // Dispatches waiting on this queue end: nothing more will come.
-        // (Those of other queues on the port see theirs is open and wait
-        // on.) After the lock above, so none misses both flag and wake.
-        port.ready.notify_all();
-        for task in pending {
-            task.run(true);
+        {
+            let mut tasks = lock(&port.tasks);
+            // Partition in place: this queue's out, the others in order.
+            let mut i = 0;
+            while i < tasks.len() {
+                if tasks[i].owner == Some(owner) {
+                    cancelled.push(tasks.remove(i).unwrap());
+                } else {
+                    i += 1;
+                }
+            }
+            // Dispatches waiting on this queue end: nothing more will come.
+            // (Those of other queues on the port see theirs is open and
+            // wait on.) After the lock above, so none misses both flag and
+            // wake.
+            port.ready.notify_all();
         }
+    }
+    // Cancellation callbacks may submit again or take locks; they run
+    // outside the port locks.
+    for task in cancelled {
+        task.run(true);
     }
     if let Some(callback) = callback {
         callback(context);
@@ -1333,5 +1372,56 @@ mod tests {
             E_ABORT
         );
         XTaskQueueCloseHandle(q);
+    }
+
+    /// Terminating a composite queue leaves the base queue's tasks queued:
+    /// the queues on a port have independent lifetimes (XTaskQueue.h).
+    #[test]
+    fn terminating_a_composite_spares_the_base_queues_tasks() {
+        extern "system" fn note(context: *mut c_void, canceled: bool) {
+            // SAFETY: the test passes a pointer to its two flags: was it
+            // called at all, and with what.
+            let seen = context.cast::<(bool, bool)>();
+            unsafe {
+                (*seen).0 = true;
+                (*seen).1 = canceled;
+            };
+        }
+        let mut base = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut base), S_OK);
+        let (mut work, mut completion) = (std::ptr::null(), std::ptr::null());
+        assert_eq!(XTaskQueueGetPort(base, WORK, &mut work), S_OK);
+        assert_eq!(XTaskQueueGetPort(base, COMPLETION, &mut completion), S_OK);
+        let mut composite = std::ptr::null();
+        assert_eq!(XTaskQueueCreateComposite(work, completion, &mut composite), S_OK);
+
+        let (mut base_saw, mut composite_saw) = ((false, false), (false, false));
+        let flags = [
+            (&mut base_saw as *mut (bool, bool)).cast(),
+            (&mut composite_saw as *mut (bool, bool)).cast(),
+        ];
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(base, WORK, 0, flags[0], Some(note)),
+            S_OK
+        );
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(composite, WORK, 0, flags[1], Some(note)),
+            S_OK
+        );
+        assert_eq!(
+            XTaskQueueTerminate(composite, true, std::ptr::null_mut(), None),
+            S_OK
+        );
+        // The composite's callback was cancelled at once; the base's is
+        // still queued.
+        assert!(!base_saw.0, "the base's task keeps its place");
+        assert_eq!(composite_saw, (true, true), "cancelled");
+        // The base's task is the only one left in the port; the base
+        // queue's dispatch runs it uncanceled.
+        assert!(XTaskQueueDispatch(base, WORK, 0));
+        assert_eq!(base_saw, (true, false), "uncanceled on the base queue");
+        assert!(!XTaskQueueDispatch(base, WORK, 0), "nothing is left");
+        XTaskQueueCloseHandle(base);
+        XTaskQueueCloseHandle(composite);
     }
 }
