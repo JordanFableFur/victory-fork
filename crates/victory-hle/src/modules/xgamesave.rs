@@ -290,26 +290,35 @@ fn containers(root: &Path) -> Vec<(String, PathBuf)> {
         {
             out.push((name, dir));
         }
+        // A directory that fails to migrate (an unreadable blob) keeps its
+        // files: a later call retries it whole.
     }
     out.sort();
     out
 }
 
 /// Moves a container of the old layout (blob files named by encoded name,
-/// a `.display` file) into a committed version, then removes it.
+/// a `.display` file) into a committed version, then removes it. A
+/// directory or blob that cannot be read leaves the old layout in place
+/// (so a later call can retry) and nothing migrates: committing half the
+/// blobs would drop the rest.
 fn migrate(root: &Path, name: &str, old: &Path) -> Option<PathBuf> {
     let dir = container_dir(root, name);
     let done = current_named(&dir, name).ok()?.is_some(); // a crash after the commit
     if !done {
         let display = std::fs::read_to_string(old.join(".display")).unwrap_or_default();
-        let mut blobs: Vec<(String, Vec<u8>)> = std::fs::read_dir(old)
-            .ok()?
-            .flatten()
-            .filter_map(|e| {
-                let blob = decode(e.file_name().to_str()?)?;
-                Some((blob, std::fs::read(e.path()).ok()?))
-            })
-            .collect();
+        let mut blobs: Vec<(String, Vec<u8>)> = Vec::new();
+        let entries = std::fs::read_dir(old).ok()?;
+        for entry in entries {
+            let entry = entry.ok()?;
+            // Unrelated names stay skipped; a recognized blob must be
+            // readable, or the migration fails whole.
+            let Some(blob) = entry.file_name().to_str().and_then(decode) else {
+                continue;
+            };
+            let data = std::fs::read(entry.path()).ok()?;
+            blobs.push((blob, data));
+        }
         blobs.sort();
         let sources: Vec<_> = blobs
             .iter()
@@ -424,6 +433,16 @@ impl Update {
     /// Applies the update as one new version of the container.
     fn submit(&self) -> HRESULT {
         let _saves = saves_lock();
+        // A legacy directory of this container's name still sitting under
+        // the root means its migration has not finished (it fails whole on
+        // an unreadable blob). Writing now would commit a version without
+        // the legacy blobs, and the next scan would clear the old
+        // directory as done: refuse until the migration has gone through.
+        if let Some(root) = self.dir.parent()
+            && root.join(file_name(&self.name)).is_dir()
+        {
+            return BLOB_NOT_FOUND;
+        }
         let current = match current(&self.dir) {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -1141,6 +1160,60 @@ mod tests {
         );
         let v = current_named(&c.dir, "Player").unwrap().unwrap();
         assert_eq!((v.number, v.display.as_str()), (1, "Chapter 1"));
+    }
+
+    /// A blob that cannot be read leaves the old directory whole: nothing
+    /// migrates (committing half the blobs would drop the rest), and a
+    /// later call with the file readable moves everything.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_blob_keeps_the_old_layout_for_a_retry() {
+        use std::os::unix::fs::PermissionsExt;
+        let saves = tempfile::tempdir().unwrap();
+        let root = saves.path().join(format!("{:016X}", xuser::XUID)).join("scid");
+        let old = root.join("Player");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("Data"), b"data").unwrap();
+        let header = old.join("Header");
+        std::fs::write(&header, b"header").unwrap();
+        let mut perms = std::fs::metadata(&header).unwrap().permissions();
+        perms.set_mode(0);
+        std::fs::set_permissions(&header, perms).unwrap();
+        // A privileged process (root) reads regardless of the mode: without
+        // the ability to deny a read, the test's premise does not hold.
+        if std::fs::read(&header).is_ok() {
+            return;
+        }
+
+        let p = Provider::open(saves.path(), Some("scid")).unwrap();
+        let _ = p.container("Player");
+        assert!(old.is_dir(), "nothing migrated");
+        assert!(old.join("Data").exists() && old.join("Header").exists());
+        // An update to the container waits for the migration: committing
+        // now would leave the legacy blobs out, and the next scan would
+        // clear the old directory as done.
+        let refused = Update {
+            name: "Player".into(),
+            dir: container_dir(&p.root, "Player"),
+            display: None,
+            changes: vec![("New".into(), Some(b"new".to_vec()))],
+        };
+        assert_eq!(refused.submit(), BLOB_NOT_FOUND);
+
+        let mut perms = std::fs::metadata(&header).unwrap().permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&header, perms).unwrap();
+        let p = Provider::open(saves.path(), Some("scid")).unwrap();
+        let c = p.container("Player");
+        let blobs = read(&c, None).unwrap();
+        assert_eq!(
+            blobs,
+            [
+                ("Data".into(), b"data".to_vec()),
+                ("Header".into(), b"header".to_vec())
+            ]
+        );
+        assert!(!old.exists());
     }
 
     /// An empty configuration id names none. As a folder name it would be
