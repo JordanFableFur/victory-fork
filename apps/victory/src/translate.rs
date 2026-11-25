@@ -143,6 +143,12 @@ impl Tally {
 /// Emitted shaders by label, shared between threads.
 type Kept = std::sync::Arc<Mutex<Vec<(String, emit::HostShader)>>>;
 
+/// Failure reasons whose containers a run has already written to disk
+/// ([`VICTORY_FAIL_DUMP`]), with the sample slots taken so far. Command-wide
+/// state: the counters in `Tally` are per worker, so a reason met first in
+/// another file would restart at slot 0 and replace an earlier sample.
+static SAMPLED: Mutex<BTreeMap<String, std::collections::BTreeSet<usize>>> = Mutex::new(BTreeMap::new());
+
 /// The optional checks after emission, one set per thread.
 struct Checks {
     /// Shaders named in `VICTORY_PAIRS` (`vs+ps,...`, label substrings),
@@ -377,17 +383,32 @@ fn translate(
         Err(e) => return t.fail(e.to_string(), example),
     };
     // `VICTORY_FAIL_DUMP=<dir>`: the first 3 containers of each failure reason, as the title
-    // has them (`.cdxil`), to work on a translator gap offline
+    // has them (`.cdxil`), to work on a translator gap offline. Sample counts are per run,
+    // not per file: two files whose first failure has the same reason must not both write
+    // `<reason>_0.cdxil`.
     let dump = std::env::var_os("VICTORY_FAIL_DUMP");
     let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
     translate_programs(&container, programs, &example, t, checks);
     if let (Some(dir), Some(before)) = (dump, before) {
         for (reason, (n, _)) in &t.failed {
             let was = before.get(reason).copied().unwrap_or(0);
-            if *n > was && was < 3 {
+            if *n > was {
+                let mut sampled = SAMPLED.lock().unwrap_or_else(|e| e.into_inner());
+                let taken = sampled.entry(reason.clone()).or_default();
                 let stem: String = reason.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(60).collect();
-                let _ = std::fs::create_dir_all(&dir);
-                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{stem}_{was}.cdxil")), &bytes[..]);
+                // Even when two sanitized reason strings collide, the next slot is one
+                // this run has not written yet. A slot is the sampler's only once the
+                // write has succeeded: a failed write (a directory that could not be
+                // made) leaves it for the next failure of the reason.
+                let slot = (was..3).find(|i| !taken.contains(i));
+                if let Some(i) = slot
+                    && std::fs::create_dir_all(&dir).is_ok()
+                {
+                    let at = std::path::Path::new(&dir).join(format!("{stem}_{i}.cdxil"));
+                    if std::fs::write(&at, &bytes[..]).is_ok() {
+                        taken.insert(i);
+                    }
+                }
             }
         }
     }
