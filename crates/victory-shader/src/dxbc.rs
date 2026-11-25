@@ -58,6 +58,9 @@ pub struct Part<'a> {
 pub struct Container<'a> {
     pub digest: [u8; 16],
     pub version: (u16, u16),
+    /// The container's byte length from its header, which `parse` validated
+    /// against `data`.
+    pub size: usize,
     pub parts: Vec<Part<'a>>,
 }
 
@@ -102,6 +105,7 @@ impl<'a> Container<'a> {
         Ok(Container {
             digest,
             version,
+            size: total,
             parts,
         })
     }
@@ -113,11 +117,12 @@ impl<'a> Container<'a> {
     /// The container's byte length from its header: what `parse` cut its
     /// view of `data` down to. A source holding the container inside a
     /// larger file slices itself to this, so the same container gives the
-    /// same bytes and the same hash wherever it sits.
+    /// same bytes and the same hash wherever it sits. The header's length,
+    /// not the last part's end: parts may sit inside it with room to spare
+    /// (padding, or offsets out of order), and cutting at the last part's
+    /// end would disagree with the header the next parse reads.
     pub fn size(&self) -> usize {
-        self.parts
-            .last()
-            .map_or(HEADER_SIZE, |last| last.offset + 8 + last.data.len())
+        self.size
     }
 }
 

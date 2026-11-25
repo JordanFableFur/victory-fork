@@ -266,4 +266,21 @@ mod tests {
         let bytes = &standalone[..];
         assert_eq!(only.bytes().as_deref(), Some(bytes));
     }
+
+    /// A container whose declared length runs past its last part (padding
+    /// inside): the source is the declared length, which the next parse
+    /// reads back.
+    #[test]
+    fn a_container_with_room_after_its_last_part_keeps_it() {
+        let mut bytes = container();
+        let padded = 0x20 + 4 + 8 + 4 + 8; // the same, plus 8 bytes of room
+        bytes[0x18..0x1C].copy_from_slice(&(padded as u32).to_le_bytes());
+        bytes.resize(padded, 0);
+        let mut file = bytes.clone();
+        file.extend_from_slice(b"tail");
+        let [only] = &sources(&file)[..] else {
+            panic!("{} containers", sources(&file).len())
+        };
+        assert_eq!(only.bytes().as_deref().map(<[u8]>::len), Some(padded));
+    }
 }
